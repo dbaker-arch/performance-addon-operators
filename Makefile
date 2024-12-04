@@ -1,7 +1,7 @@
 IMAGE_BUILD_CMD ?= "docker"
 IMAGE_REGISTRY ?= "quay.io"
 REGISTRY_NAMESPACE ?= "openshift-kni"
-IMAGE_TAG ?= "4.7-snapshot"
+IMAGE_TAG ?= "4.12-snapshot"
 
 TARGET_GOOS=linux
 TARGET_GOARCH=amd64
@@ -10,20 +10,18 @@ CACHE_DIR="_cache"
 TOOLS_DIR="$(CACHE_DIR)/tools"
 TOOLS_BIN_DIR="build/_output/bin"
 
-OPERATOR_SDK_VERSION="v1.0.0"
-OPERATOR_SDK_PLATFORM ?= "x86_64-linux-gnu"
-OPERATOR_SDK_BIN="operator-sdk-$(OPERATOR_SDK_VERSION)-$(OPERATOR_SDK_PLATFORM)"
+OPERATOR_SDK_VERSION="v1.11.0"
+OPERATOR_SDK_PLATFORM ?= "linux_amd64"
+OPERATOR_SDK_BIN="operator-sdk_$(OPERATOR_SDK_PLATFORM)"
 OPERATOR_SDK="$(TOOLS_DIR)/$(OPERATOR_SDK_BIN)"
 
 OPERATOR_IMAGE_NAME="performance-addon-operator"
-REGISTRY_IMAGE_NAME="performance-addon-operator-registry"
 BUNDLE_IMAGE_NAME="performance-addon-operator-bundle"
 INDEX_IMAGE_NAME="performance-addon-operator-index"
 MUSTGATHER_IMAGE_NAME="performance-addon-operator-must-gather"
 LATENCY_TEST_IMAGE_NAME="latency-test"
 
 FULL_OPERATOR_IMAGE ?= "$(IMAGE_REGISTRY)/$(REGISTRY_NAMESPACE)/$(OPERATOR_IMAGE_NAME):$(IMAGE_TAG)"
-FULL_REGISTRY_IMAGE ?= "${IMAGE_REGISTRY}/${REGISTRY_NAMESPACE}/${REGISTRY_IMAGE_NAME}:${IMAGE_TAG}"
 FULL_BUNDLE_IMAGE ?= "${IMAGE_REGISTRY}/${REGISTRY_NAMESPACE}/${BUNDLE_IMAGE_NAME}:${IMAGE_TAG}"
 FULL_INDEX_IMAGE ?= "${IMAGE_REGISTRY}/${REGISTRY_NAMESPACE}/${INDEX_IMAGE_NAME}:${IMAGE_TAG}"
 FULL_MUSTGATHER_IMAGE ?= "${IMAGE_REGISTRY}/${REGISTRY_NAMESPACE}/${MUSTGATHER_IMAGE_NAME}:${IMAGE_TAG}"
@@ -40,8 +38,16 @@ BUILD_DATE=$$(date --utc -Iseconds)
 # Export GO111MODULE=on to enable project to be built from within GOPATH/src
 export GO111MODULE=on
 
+.PHONY: all
+all: build
+
+# keep this target the first!
 .PHONY: build
-build: gofmt golint govet dist generate-manifests-tree
+build: gofmt golint govet dist-gather-sysinfo dist create-performance-profile generate-manifests-tree
+
+# just a shortcut for now
+.PHONY: clean
+clean: dist-clean
 
 .PHONY: dist
 dist: build-output-dir
@@ -51,30 +57,44 @@ dist: build-output-dir
     LDFLAGS+="-X github.com/openshift-kni/performance-addon-operators/version.Version=$(VERSION) "; \
     LDFLAGS+="-X github.com/openshift-kni/performance-addon-operators/version.GitCommit=$(COMMIT) "; \
     LDFLAGS+="-X github.com/openshift-kni/performance-addon-operators/version.BuildDate=$(BUILD_DATE) "; \
-	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -ldflags="$$LDFLAGS" \
+	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="$$LDFLAGS" \
 	  -mod=vendor -o $(TOOLS_BIN_DIR)/performance-addon-operators .
 
 .PHONY: dist-tools
-dist-tools: dist-csv-generator dist-csv-replace-imageref
+dist-tools: dist-csv-processor dist-csv-replace-imageref
 
 .PHONY: dist-clean
 dist-clean:
 	rm -rf build/_output/bin
 
-.PHONY: dist-csv-generator
-dist-csv-generator: build-output-dir
-	@if [ ! -x $(TOOLS_BIN_DIR)/csv-generator ]; then\
-		echo "Building csv-generator tool";\
-		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/csv-generator ./tools/csv-generator;\
+.PHONY: dist-gather-sysinfo
+dist-gather-sysinfo: build-output-dir
+	@if [ ! -x $(TOOLS_BIN_DIR)/gather-sysinfo ]; then\
+		echo "Building gather-sysinfo helper";\
+		env CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/gather-sysinfo ./tools/gather-sysinfo;\
 	else \
-		echo "Using pre-built csv-generator tool";\
+		echo "Using pre-built gather-sysinfo helper";\
+	fi
+
+.PHONY: dist-hugepages-mc-genarator
+dist-hugepages-mc-genarator: build-output-dir
+	echo "Building hugepages machineconfig genarator tool";\
+	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/hugepages-machineconfig-generator ./tools/hugepages-machineconfig-generator
+
+.PHONY: dist-csv-processor
+dist-csv-processor: build-output-dir
+	@if [ ! -x $(TOOLS_BIN_DIR)/csv-processor ]; then\
+		echo "Building csv-processor tool";\
+		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/csv-processor ./tools/csv-processor;\
+	else \
+		echo "Using pre-built csv-processor tool";\
 	fi
 
 .PHONY: dist-csv-replace-imageref
 dist-csv-replace-imageref: build-output-dir
 	@if [ ! -x $(TOOLS_BIN_DIR)/csv-replace-imageref ]; then\
 		echo "Building csv-replace-imageref tool";\
-		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/csv-replace-imageref ./tools/csv-replace-imageref;\
+		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/csv-replace-imageref ./tools/csv-replace-imageref;\
 	else \
 		echo "Using pre-built csv-replace-imageref tool";\
 	fi
@@ -83,19 +103,32 @@ dist-csv-replace-imageref: build-output-dir
 dist-docs-generator: build-output-dir
 	@if [ ! -x $(TOOLS_BIN_DIR)/docs-generator ]; then\
 		echo "Building docs-generator tool";\
-		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/docs-generator ./tools/docs-generator;\
+		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/docs-generator ./tools/docs-generator;\
 	else \
 		echo "Using pre-built docs-generator tool";\
 	fi
+
+.PHONY: dist-imgpull-tool
+dist-imgpull-tool: build-output-dir
+	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(TOOLS_BIN_DIR)/imgpull-tool ./tools/imgpull-tool
 
 .PHONY: dist-functests
 dist-functests:
 	./hack/build-test-bin.sh
 
+.PHONY: dist-latency-tests
+dist-latency-tests:
+	./hack/build-latency-test-bin.sh
+
+.PHONY: new-zversion
+new-zversion: bump-zversion generate
+
+.PHONY: bump-zversion
+bump-zversion:
+	./hack/bump-zversion.sh
+
 .PHONY: build-containers
-# order matters here. bundle-container must always run after registry-container because of both target deps.
-# generate-manifests-tree wants to run on up to date manifests.
-build-containers: registry-container bundle-container index-container operator-container must-gather-container
+build-containers: bundle-container index-container operator-container must-gather-container
 
 .PHONY: operator-container
 operator-container: build
@@ -111,20 +144,15 @@ bundle-container: generate-metadata generate-manifests-tree
 	@echo "Building the performance-addon-operator bundle image"
 	$(IMAGE_BUILD_CMD) build --no-cache -f openshift-ci/Dockerfile.bundle.upstream.dev -t "$(FULL_BUNDLE_IMAGE)" .
 
-.PHONY: registry-container
-registry-container: generate-manifests-tree
-	@echo "Building the performance-addon-operator registry image"
-	$(IMAGE_BUILD_CMD) build --no-cache -f openshift-ci/Dockerfile.registry.upstream.dev -t "$(FULL_REGISTRY_IMAGE)" --build-arg FULL_OPERATOR_IMAGE="$(FULL_OPERATOR_IMAGE)"  .
-
 .PHONY: index-container
 index-container: generate-index-database
 	@echo "Building the performance-addon-operator index image"
 	$(IMAGE_BUILD_CMD) build --no-cache -f build/_output/index.Dockerfile -t "$(FULL_INDEX_IMAGE)" build/_output
 
 .PHONY: must-gather-container
-must-gather-container:
+must-gather-container: build
 	@echo "Building the performance-addon-operator must-gather image"
-	$(IMAGE_BUILD_CMD) build --no-cache -f openshift-ci/Dockerfile.must-gather -t "$(FULL_MUSTGATHER_IMAGE)"  .
+	$(IMAGE_BUILD_CMD) build --no-cache -f openshift-ci/Dockerfile.must-gather -t "$(FULL_MUSTGATHER_IMAGE)" --build-arg BIN_DIR="build/_output/bin/" .
 
 .PHONY: latency-test-container
 latency-test-container:
@@ -138,7 +166,6 @@ push-bundle-container:
 .PHONY: push-containers
 push-containers:
 	$(IMAGE_BUILD_CMD) push $(FULL_OPERATOR_IMAGE)
-	$(IMAGE_BUILD_CMD) push $(FULL_REGISTRY_IMAGE)
 	$(IMAGE_BUILD_CMD) push $(FULL_BUNDLE_IMAGE)
 	$(IMAGE_BUILD_CMD) push $(FULL_INDEX_IMAGE)
 	$(IMAGE_BUILD_CMD) push $(FULL_MUSTGATHER_IMAGE)
@@ -154,8 +181,16 @@ operator-sdk:
 		echo "Using operator-sdk cached at $(OPERATOR_SDK)";\
 	fi
 
+.PHONY: create-performance-profile
+create-performance-profile:  build-output-dir
+	echo "Creating performance profile"
+	mkdir -p $(TOOLS_BIN_DIR); \
+	LDFLAGS="-s -w "; \
+	LDFLAGS+="-X github.com/openshift-kni/performance-addon-operators/cmd/performance-profile-creator "; \
+	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build  -v $(LDFLAGS) -o $(TOOLS_BIN_DIR)/performance-profile-creator ./cmd/performance-profile-creator
+
 .PHONY: generate-csv
-generate-csv: operator-sdk kustomize dist-csv-generator
+generate-csv: operator-sdk kustomize dist-csv-processor
 	@if [ -z "$(REGISTRY_NAMESPACE)" ]; then\
 		echo "REGISTRY_NAMESPACE env-var must be set to your $(IMAGE_REGISTRY) namespace";\
 		exit 1;\
@@ -167,7 +202,7 @@ build-output-dir:
 	mkdir -p $(TOOLS_BIN_DIR) || :
 
 .PHONY: generate-latest-dev-csv
-generate-latest-dev-csv: operator-sdk kustomize dist-csv-generator build-output-dir
+generate-latest-dev-csv: operator-sdk kustomize dist-csv-processor build-output-dir
 	@echo Generating developer csv
 	@echo
 	OPERATOR_SDK=$(OPERATOR_SDK) KUSTOMIZE=$(KUSTOMIZE) FULL_OPERATOR_IMAGE="REPLACE_IMAGE" hack/csv-generate.sh -dev
@@ -224,16 +259,32 @@ functests: cluster-label-worker-cnf functests-only
 
 .PHONY: functests-only
 functests-only:
+	@echo "Cluster Version"
+	hack/show-cluster-version.sh
 	hack/run-functests.sh
 
 .PHONY: functests-latency
 functests-latency: cluster-label-worker-cnf
 	GINKGO_SUITS="functests/0_config functests/4_latency" LATENCY_TEST_RUN="true" hack/run-functests.sh
 
+.PHONY: functests-latency-testing
+functests-latency-testing: dist-latency-tests
+	GINKGO_SUITS="functests/0_config functests/5_latency_testing" hack/run-latency-testing.sh
+
 .PHONY: operator-upgrade-tests
 operator-upgrade-tests:
 	@echo "Running Operator Upgrade Tests"
 	hack/run-upgrade-tests.sh
+
+.PHONY: perf-profile-creator-tests
+perf-profile-creator-tests: create-performance-profile
+	@echo "Running Performance Profile Creator Tests"
+	hack/run-perf-profile-creator-functests.sh
+
+.PHONY: render-command-tests
+render-command-tests: dist
+	@echo "Running Render Command Tests"
+	hack/run-render-command-functests.sh
 
 .PHONY: unittests
 unittests:
@@ -255,7 +306,7 @@ govet:
 	go vet ./...
 
 .PHONY: generate
-generate: deps-update gofmt manifests generate-code generate-latest-dev-csv generate-docs
+generate: clean deps-update gofmt manifests generate-code generate-latest-dev-csv generate-docs
 	@echo Updating generated files
 	@echo
 
@@ -267,6 +318,13 @@ verify: golint govet generate
 .PHONY: ci-job
 ci-job: verify build unittests
 
+.PHONY: ci-tools-job
+ci-tools-job:
+	@echo "Cluster Version"
+	hack/show-cluster-version.sh
+	@echo "Verifying tools operation"
+	hack/verify-tools.sh
+	
 .PHONY: release-note
 release-note:
 	hack/release-note.sh
@@ -300,7 +358,7 @@ generate-code: controller-gen
 controller-gen: build-output-dir
 	@if [ ! -x $(CONTROLLER_GEN) ]; then\
 		echo "Building $(CONTROLLER_GEN)";\
-		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -ldflags="-s -w" -mod=vendor -o $(CONTROLLER_GEN) vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go ;\
+		env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -ldflags="-s -w" -mod=vendor -o $(CONTROLLER_GEN) vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go ;\
 	else \
 		echo "Using pre-built $(CONTROLLER_GEN)";\
 	fi

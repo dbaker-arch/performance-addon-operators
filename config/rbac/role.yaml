@@ -13,6 +13,22 @@ rules:
   verbs:
   - '*'
 - apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - config.openshift.io
+  resources:
+  - infrastructures
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - machineconfiguration.openshift.io
   resources:
   - kubeletconfigs
@@ -37,6 +53,7 @@ rules:
 - apiGroups:
   - tuned.openshift.io
   resources:
+  - profiles
   - tuneds
   verbs:
   - '*'
@@ -47,17 +64,8 @@ kind: Role
 metadata:
   creationTimestamp: null
   name: performance-operator
-  namespace: openshift-performance-addon
+  namespace: openshift-performance-addon-operator
 rules:
-- apiGroups:
-  - apps
-  resources:
-  - daemonsets
-  - deployments
-  - replicasets
-  - statefulsets
-  verbs:
-  - '*'
 - apiGroups:
   - apps
   resourceNames:
@@ -65,6 +73,15 @@ rules:
   resources:
   - deployments/finalizers
   verbs:
+  - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - list
   - update
 - apiGroups:
   - ""

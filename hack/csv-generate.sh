@@ -24,15 +24,16 @@ OUT_CSV_FILE="${OUT_DIR}/${CSV_VERSION}/${PACKAGE_NAME}.clusterserviceversion.ya
 
 TEMPLATES_DIR="${OUT_ROOT}/templates"
 CSV_TEMPLATE_FILE="${TEMPLATES_DIR}/${PACKAGE_NAME}.v${CSV_VERSION}.clusterserviceversion.yaml"
+ICON_FILE="docs/pao-icon.svg"
 
 EXTRA_ANNOTATIONS=""
-MAINTAINERS=""
+EXTRA_MAINTAINERS=""
 
 if [ -n "$MAINTAINERS_FILE" ]; then
-  MAINTAINERS="-maintainers-from=$MAINTAINERS_FILE"
+  EXTRA_MAINTAINERS="--maintainers-from=$MAINTAINERS_FILE"
 fi
 if [ -n "$ANNOTATIONS_FILE" ]; then
-  EXTRA_ANNOTATIONS="-annotations-from=$ANNOTATIONS_FILE"
+  EXTRA_ANNOTATIONS="--annotations-from=$ANNOTATIONS_FILE"
 fi
 
 clean_package() {
@@ -53,7 +54,7 @@ fi
 clean_package
 
 # do not generate new CRD/CSV for old versions
-if [[ ${CSV_VERSION} =~ 4.7.* ]]; then
+if [[ ${CSV_VERSION} =~ 4.11.* ]]; then
   cp -a deploy/olm-catalog build/_output
 
   # generate a temporary csv we'll use as a template
@@ -67,7 +68,7 @@ if [[ ${CSV_VERSION} =~ 4.7.* ]]; then
     --output-dir="${OUT_DIR}" \
     --crds-dir="config/crd/bases"
 
-  # copy template CSV file to preserve it for our csv-generator
+  # copy template CSV file to preserve it for our csv-processor
   mv "${OUT_CSV_FILE}" "${CSV_TEMPLATE_FILE}"
 
   # copy the CRD before the generator will delete it
@@ -75,15 +76,17 @@ if [[ ${CSV_VERSION} =~ 4.7.* ]]; then
     "${CSV_DIR}/performance.openshift.io_performanceprofiles_crd.yaml"
 
   # using the generated CSV, create the real CSV by injecting all the right data into it
-  build/_output/bin/csv-generator \
+  build/_output/bin/csv-processor \
     --csv-version "${CSV_VERSION}" \
     --operator-csv-template-file "${CSV_TEMPLATE_FILE}" \
     --operator-image "${FULL_OPERATOR_IMAGE}" \
     --olm-bundle-directory "${OUT_CSV_DIR}" \
     --replaces-csv-version "${REPLACES_CSV_VERSION}" \
     --skip-range "${CSV_SKIP_RANGE}" \
-    "${MAINTAINERS}" \
-    "${EXTRA_ANNOTATIONS}"
+    --min-kube-version "${MIN_KUBE_VERSION}" \
+    --icon-from "${ICON_FILE}" \
+    "${EXTRA_ANNOTATIONS}" \
+    "${EXTRA_MAINTAINERS}"
 
   # restore the deleted CRD
   cp "${CSV_DIR}/performance.openshift.io_performanceprofiles_crd.yaml" \

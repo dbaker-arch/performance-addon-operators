@@ -1,12 +1,18 @@
 package utils
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"os/exec"
+	"time"
 
 	. "github.com/onsi/ginkgo"
 
-	"k8s.io/klog"
+	testlog "github.com/openshift-kni/performance-addon-operators/functests/utils/log"
 )
+
+const defaultExecTimeout = 2 * time.Minute
 
 func BeforeAll(fn func()) {
 	first := true
@@ -19,10 +25,35 @@ func BeforeAll(fn func()) {
 }
 
 func ExecAndLogCommand(name string, arg ...string) ([]byte, error) {
-	out, err := exec.Command(name, arg...).Output()
-	klog.Infof("run command '%s %v' (err=%v):\n  stdout=%s\n", name, arg, err, out)
-	if exitError, ok := err.(*exec.ExitError); ok {
-		klog.Infof("run command '%s %v' (err=%v):\n  stderr=%s", name, arg, err, exitError.Stderr)
+	outData, _, err := ExecAndLogCommandWithStderr(name, arg...)
+	return outData, err
+}
+
+func ExecAndLogCommandWithStderr(name string, arg ...string) ([]byte, []byte, error) {
+	// Create a new context and add a timeout to it
+	ctx, cancel := context.WithTimeout(context.Background(), defaultExecTimeout)
+	defer cancel() // The cancel should be deferred so resources are cleaned up
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, name, arg...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	outData := stdout.Bytes()
+	errData := stderr.Bytes()
+	testlog.Infof("run command '%s %v' (err=%v):\n  stdout=%q\n  stderr=%q", name, arg, err, outData, errData)
+
+	// We want to check the context error to see if the timeout was executed.
+	// The error returned by cmd.Output() will be OS specific based on what
+	// happens when a process is killed.
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, nil, fmt.Errorf("command '%s %v' failed because of the timeout", name, arg)
 	}
-	return out, err
+
+	if _, ok := err.(*exec.ExitError); ok {
+		testlog.Infof("run command '%s %v' (err=%v):\n  stderr=%s", name, arg, err, string(errData))
+	}
+	return outData, errData, err
 }

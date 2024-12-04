@@ -3,8 +3,6 @@ package __performance_status
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"time"
 
 	ign2types "github.com/coreos/ignition/config/v2_2/types"
 	. "github.com/onsi/ginkgo"
@@ -14,7 +12,6 @@ import (
 	machineconfigv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	performancev2 "github.com/openshift-kni/performance-addon-operators/api/v2"
 	testutils "github.com/openshift-kni/performance-addon-operators/functests/utils"
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/discovery"
@@ -28,12 +25,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
-	"k8s.io/utils/pointer"
 )
 
 var _ = Describe("Status testing of performance profile", func() {
-	var workerCNFNodes []corev1.Node
-	var err error
+	var (
+		workerCNFNodes []corev1.Node
+		err            error
+		clean          func() error
+	)
 
 	BeforeEach(func() {
 		if discovery.Enabled() && testutils.ProfileNotFound {
@@ -42,13 +41,22 @@ var _ = Describe("Status testing of performance profile", func() {
 		workerCNFNodes, err = nodes.GetByLabels(testutils.NodeSelectorLabels)
 		Expect(err).ToNot(HaveOccurred())
 		workerCNFNodes, err = nodes.MatchingOptionalSelector(workerCNFNodes)
-		Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("error looking for the optional selector: %v", err))
+		Expect(err).ToNot(HaveOccurred(), "error looking for the optional selector: %v", err)
 		Expect(workerCNFNodes).ToNot(BeEmpty())
+		// initialized clean function handler to be nil on every It execution
+		clean = nil
+	})
+
+	AfterEach(func() {
+		if clean != nil {
+			clean()
+		}
+
 	})
 
 	Context("[rfe_id:28881][performance] Performance Addons detailed status", func() {
 
-		It("[test_id:30894] Tuned status field tied to Performance Profile", func() {
+		It("[test_id:30894] Tuned status name tied to Performance Profile", func() {
 			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
 			Expect(err).ToNot(HaveOccurred())
 			key := types.NamespacedName{
@@ -107,65 +115,42 @@ var _ = Describe("Status testing of performance profile", func() {
 
 			mcps.WaitForCondition(performanceMCP, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
 		})
-	})
 
-	Context("Status reports degraded condition", func() {
-		It("Should report Degraded status if overlapping cpus are configured", func() {
-			if discovery.Enabled() {
-				Skip("Discovery mode enabled, test skipped because it creates incorrect profiles")
-			}
+		It("[test_id:40402] Tuned profile status tied to Performance Profile", func() {
+			// During this test we're creating additional synthetic tuned CR by invoking the createrBadTuned function.
+			// This synthetic tuned will look for a tuned profile which doesn't exist.
+			// This tuned CR will be applied on the profiles.tuned.openshift.io CR (there is such profile per node)
+			// which is associate to the node object with the same name.
+			// The connection between the node object and the tuned object is via the MachineConfigLables, worker-cnf in our case.
+			ns := "openshift-cluster-node-tuning-operator"
+			tunedName := "openshift-cause-tuned-failure"
 
-			newRole := "worker-overlapping"
-			newLabel := fmt.Sprintf("%s/%s", testutils.LabelRole, newRole)
-
-			reserved := performancev2.CPUSet("0-3")
-			isolated := performancev2.CPUSet("0-7")
-
-			overlappingProfile := &performancev2.PerformanceProfile{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "PerformanceProfile",
-					APIVersion: performancev2.GroupVersion.String(),
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "profile-overlapping-cpus",
-				},
-				Spec: performancev2.PerformanceProfileSpec{
-					CPU: &performancev2.CPU{
-						Reserved: &reserved,
-						Isolated: &isolated,
-					},
-					NodeSelector: map[string]string{newLabel: ""},
-					RealTimeKernel: &performancev2.RealTimeKernel{
-						Enabled: pointer.BoolPtr(true),
-					},
-					NUMA: &performancev2.NUMA{
-						TopologyPolicy: pointer.StringPtr("restricted"),
-					},
-				},
-			}
-			err := testclient.Client.Create(context.TODO(), overlappingProfile)
-			Expect(err).ToNot(HaveOccurred(), "error creating overlappingProfile: %v", err)
-			defer func() {
-				Expect(testclient.Client.Delete(context.TODO(), overlappingProfile)).ToNot(HaveOccurred())
-
+			// Make sure to clean badTuned object even if the It threw an error
+			clean = func() error {
 				key := types.NamespacedName{
-					Name:      overlappingProfile.Name,
-					Namespace: overlappingProfile.Namespace,
+					Name:      tunedName,
+					Namespace: ns,
 				}
-				Expect(profiles.WaitForDeletion(key, 60*time.Second)).ToNot(HaveOccurred())
-
-				Consistently(func() corev1.ConditionStatus {
-					return mcps.GetConditionStatus(testutils.RoleWorkerCNF, machineconfigv1.MachineConfigPoolUpdating)
-				}, 30, 5).Should(Equal(corev1.ConditionFalse), "Machine Config Pool is updating, and it should not")
-
-			}()
-
-			nodeLabels := map[string]string{
-				newLabel: "",
+				runtimeClass := &tunedv1.Tuned{}
+				err := testclient.Client.Get(context.TODO(), key, runtimeClass)
+				// if err != nil probably the resource were already deleted
+				if err == nil {
+					testclient.Client.Delete(context.TODO(), runtimeClass)
+				}
+				return err
 			}
 
-			cond := profiles.GetConditionWithStatus(nodeLabels, v1.ConditionDegraded)
-			Expect(cond.Message).To(ContainSubstring("reserved and isolated cpus overlap"), "Profile condition degraded unexpected status: %q")
+			// Creating bad Tuned object that leads to degraded state
+			badTuned := createBadTuned(tunedName, ns)
+			err = testclient.Client.Create(context.TODO(), badTuned)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for performance profile condition to be Degraded")
+			profiles.WaitForCondition(testutils.NodeSelectorLabels, v1.ConditionDegraded, corev1.ConditionTrue)
+
+			By("Deleting bad Tuned and waiting when Degraded state is removed")
+			err = testclient.Client.Delete(context.TODO(), badTuned)
+			profiles.WaitForCondition(testutils.NodeSelectorLabels, v1.ConditionAvailable, corev1.ConditionTrue)
 		})
 	})
 })
@@ -202,4 +187,38 @@ func createBadMachineConfig(name string) *machineconfigv1.MachineConfig {
 			},
 		},
 	}
+}
+
+func createBadTuned(name, ns string) *tunedv1.Tuned {
+	priority := uint64(20)
+	// include=profile-does-not-exist
+	// points to tuned profile which doesn't exist
+	data := "[main]\nsummary=A Tuned daemon profile that does not exist\ninclude=profile-does-not-exist"
+
+	return &tunedv1.Tuned{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: tunedv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			UID:       types.UID(utilrand.String(5)),
+		},
+		Spec: tunedv1.TunedSpec{
+			Profile: []tunedv1.TunedProfile{
+				{
+					Name: &name,
+					Data: &data,
+				},
+			},
+			Recommend: []tunedv1.TunedRecommend{
+				{
+					MachineConfigLabels: map[string]string{"machineconfiguration.openshift.io/role": testutils.RoleWorkerCNF},
+					Priority:            &priority,
+					Profile:             &name,
+				},
+			},
+		},
+	}
+
 }

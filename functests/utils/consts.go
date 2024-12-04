@@ -42,7 +42,7 @@ func init() {
 	}
 
 	if discovery.Enabled() {
-		profile, err := discovery.GetDiscoveryPerformanceProfile()
+		profile, err := discovery.GetDiscoveryPerformanceProfile(NodesSelector)
 		if err == discovery.ErrProfileNotFound {
 			ProfileNotFound = true
 			return
@@ -59,6 +59,9 @@ func init() {
 		NodeSelectorLabels = profile.Spec.NodeSelector
 		if NodesSelector != "" {
 			keyValue := strings.Split(NodesSelector, "=")
+			if len(keyValue) == 1 {
+				keyValue = append(keyValue, "")
+			}
 			NodeSelectorLabels[keyValue[0]] = keyValue[1]
 		}
 	}
@@ -79,8 +82,6 @@ const (
 )
 
 const (
-	// PerformanceOperatorNamespace contains the name of the performance operator namespace
-	PerformanceOperatorNamespace = "openshift-performance-addon"
 	// NamespaceMachineConfigOperator contains the namespace of the machine-config-opereator
 	NamespaceMachineConfigOperator = "openshift-machine-config-operator"
 	// NamespaceTesting contains the name of the testing namespace

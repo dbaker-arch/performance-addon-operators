@@ -5,8 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -15,12 +18,17 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	testutils "github.com/openshift-kni/performance-addon-operators/functests/utils"
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/images"
+	"github.com/openshift-kni/performance-addon-operators/functests/utils/namespaces"
 )
+
+// DefaultDeletionTimeout contains the default pod deletion timeout in seconds
+const DefaultDeletionTimeout = 120
 
 // GetTestPod returns pod with the busybox image
 func GetTestPod() *corev1.Pod {
@@ -79,6 +87,22 @@ func WaitForCondition(pod *corev1.Pod, conditionType corev1.PodConditionType, co
 	})
 }
 
+// WaitForPredicate waits until the given predicate against the pod returns true or error.
+func WaitForPredicate(pod *corev1.Pod, timeout time.Duration, pred func(pod *corev1.Pod) (bool, error)) error {
+	return wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+		updatedPod := &corev1.Pod{}
+		if err := testclient.Client.Get(context.TODO(), client.ObjectKeyFromObject(pod), updatedPod); err != nil {
+			return false, nil
+		}
+
+		ret, err := pred(updatedPod)
+		if err != nil {
+			return false, err
+		}
+		return ret, nil
+	})
+}
+
 // WaitForPhase waits until the pod will have specified phase
 func WaitForPhase(pod *corev1.Pod, phase corev1.PodPhase, timeout time.Duration) error {
 	key := types.NamespacedName{
@@ -115,20 +139,70 @@ func GetLogs(c *kubernetes.Clientset, pod *corev1.Pod) (string, error) {
 	return buf.String(), nil
 }
 
-// ExecCommandOnPod returns the output of the command execution on the pod
-func ExecCommandOnPod(pod *corev1.Pod, command []string) ([]byte, error) {
-	initialArgs := []string{
-		"exec",
-		"-i",
-		"-n", pod.Namespace,
-		pod.Name,
-		"--",
+// ExecCommandOnPod runs command in the pod and returns buffer output
+func ExecCommandOnPod(c *kubernetes.Clientset, pod *corev1.Pod, command []string) ([]byte, error) {
+	var outputBuf bytes.Buffer
+	var errorBuf bytes.Buffer
+
+	req := c.CoreV1().RESTClient().
+		Post().
+		Namespace(pod.Namespace).
+		Resource("pods").
+		Name(pod.Name).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: pod.Spec.Containers[0].Name,
+			Command:   command,
+			Stdin:     true,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       true,
+		}, scheme.ParameterCodec)
+
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return nil, err
 	}
-	initialArgs = append(initialArgs, command...)
-	return testutils.ExecAndLogCommand("oc", initialArgs...)
+
+	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
+	if err != nil {
+		return nil, err
+	}
+
+	err = exec.Stream(remotecommand.StreamOptions{
+		Stdin:  os.Stdin,
+		Stdout: &outputBuf,
+		Stderr: &errorBuf,
+		Tty:    true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to run command %v: output %s; error %s", command, outputBuf.String(), errorBuf.String())
+	}
+
+	if errorBuf.Len() != 0 {
+		return nil, fmt.Errorf("failed to run command %v: output %s; error %s", command, outputBuf.String(), errorBuf.String())
+	}
+
+	return outputBuf.Bytes(), nil
 }
 
-// GetContainerID returns container ID under the pod by the container name
+func WaitForPodOutput(c *kubernetes.Clientset, pod *corev1.Pod, command []string) ([]byte, error) {
+	var out []byte
+	if err := wait.PollImmediate(15*time.Second, time.Minute, func() (done bool, err error) {
+		out, err = ExecCommandOnPod(c, pod, command)
+		if err != nil {
+			return false, err
+		}
+
+		return len(out) != 0, nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// GetContainerIDByName returns container ID under the pod by the container name
 func GetContainerIDByName(pod *corev1.Pod, containerName string) (string, error) {
 	updatedPod := &corev1.Pod{}
 	key := types.NamespacedName{
@@ -155,7 +229,7 @@ func GetPerformanceOperatorPod() (*corev1.Pod, error) {
 
 	pods := &corev1.PodList{}
 
-	opts := &client.ListOptions{LabelSelector: selector, Namespace: testutils.PerformanceOperatorNamespace}
+	opts := &client.ListOptions{LabelSelector: selector, Namespace: namespaces.PerformanceOperator}
 	if err := testclient.Client.List(context.TODO(), pods, opts); err != nil {
 		return nil, err
 	}

@@ -2,25 +2,29 @@ package mcps
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	performancev2 "github.com/openshift-kni/performance-addon-operators/api/v2"
 	machineconfigv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
+	"github.com/openshift-kni/performance-addon-operators/functests/utils/cluster"
+	testlog "github.com/openshift-kni/performance-addon-operators/functests/utils/log"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/nodes"
 	"github.com/openshift-kni/performance-addon-operators/pkg/controller/performanceprofile/components"
+	"github.com/openshift-kni/performance-addon-operators/pkg/controller/performanceprofile/components/machineconfig"
 	"github.com/openshift-kni/performance-addon-operators/pkg/controller/performanceprofile/components/profile"
 )
 
@@ -40,7 +44,27 @@ func GetByLabel(key, value string) ([]machineconfigv1.MachineConfigPool, error) 
 	if err := testclient.Client.List(context.TODO(), mcps, &client.ListOptions{LabelSelector: selector}); err != nil {
 		return nil, err
 	}
-	return mcps.Items, nil
+	if len(mcps.Items) > 0 {
+		return mcps.Items, nil
+	}
+	// fallback to look for a mcp with the same nodeselector.
+	// key value may come from a node selector, so looking for a mcp
+	// that targets the same nodes is legit
+	if err := testclient.Client.List(context.TODO(), mcps); err != nil {
+		return nil, err
+	}
+	res := []machineconfigv1.MachineConfigPool{}
+	for _, item := range mcps.Items {
+		if item.Spec.NodeSelector.MatchLabels[key] == value {
+			res = append(res, item)
+		}
+		nodeRoleKey := components.NodeRoleLabelPrefix + value
+
+		if _, ok := item.Spec.NodeSelector.MatchLabels[nodeRoleKey]; ok {
+			res = append(res, item)
+		}
+	}
+	return res, nil
 }
 
 // GetByName returns the MCP with the specified name
@@ -51,6 +75,18 @@ func GetByName(name string) (*machineconfigv1.MachineConfigPool, error) {
 		Namespace: metav1.NamespaceNone,
 	}
 	err := testclient.GetWithRetry(context.TODO(), key, mcp)
+	return mcp, err
+}
+
+// GetByNameNoRetry returns the MCP with the specified name without retrying to poke
+// the api server
+func GetByNameNoRetry(name string) (*machineconfigv1.MachineConfigPool, error) {
+	mcp := &machineconfigv1.MachineConfigPool{}
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: metav1.NamespaceNone,
+	}
+	err := testclient.Client.Get(context.TODO(), key, mcp)
 	return mcp, err
 }
 
@@ -93,8 +129,12 @@ func New(mcpName string, nodeSelector map[string]string) *machineconfigv1.Machin
 
 // GetConditionStatus return the condition status of the given MCP and condition type
 func GetConditionStatus(mcpName string, conditionType machineconfigv1.MachineConfigPoolConditionType) corev1.ConditionStatus {
-	mcp, err := GetByName(mcpName)
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Failed getting MCP by name")
+	mcp, err := GetByNameNoRetry(mcpName)
+	if err != nil {
+		// In case of any error we just retry, as in case of single node cluster
+		// the only node may be rebooting
+		return corev1.ConditionUnknown
+	}
 	for _, condition := range mcp.Status.Conditions {
 		if condition.Type == conditionType {
 			return condition.Status
@@ -106,7 +146,7 @@ func GetConditionStatus(mcpName string, conditionType machineconfigv1.MachineCon
 // GetConditionReason return the reason of the given MCP
 func GetConditionReason(mcpName string, conditionType machineconfigv1.MachineConfigPoolConditionType) string {
 	mcp, err := GetByName(mcpName)
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Failed getting MCP by name")
+	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Failed getting MCP %q by name", mcpName)
 	for _, condition := range mcp.Status.Conditions {
 		if condition.Type == conditionType {
 			return condition.Reason
@@ -117,39 +157,80 @@ func GetConditionReason(mcpName string, conditionType machineconfigv1.MachineCon
 
 // WaitForCondition waits for the MCP with given name having a condition of given type with given status
 func WaitForCondition(mcpName string, conditionType machineconfigv1.MachineConfigPoolConditionType, conditionStatus corev1.ConditionStatus) {
-	mcp, err := GetByName(mcpName)
-	Expect(err).ToNot(HaveOccurred(), "Failed getting MCP by name")
 
-	nodeLabels := mcp.Spec.NodeSelector.MatchLabels
-	key, _ := components.GetFirstKeyAndValue(nodeLabels)
-	req, err := labels.NewRequirement(key, selection.Operator(selection.Exists), []string{})
-	Expect(err).ToNot(HaveOccurred(), "Failed creating node selector")
+	var cnfNodes []corev1.Node
+	runningOnSingleNode, err := cluster.IsSingleNode()
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	// checking in eventually as in case of single node cluster the only node may
+	// be rebooting
+	EventuallyWithOffset(1, func() error {
+		mcp, err := GetByName(mcpName)
+		if err != nil {
+			return errors.Wrap(err, "Failed getting MCP by name")
+		}
 
-	selector := labels.NewSelector()
-	selector = selector.Add(*req)
-	cnfNodes, err := nodes.GetBySelector(selector)
-	Expect(err).ToNot(HaveOccurred(), "Failed getting nodes by selector")
-	Expect(cnfNodes).ToNot(BeEmpty(), "Found no CNF nodes")
-	klog.Infof("MCP is targeting %v node(s)", len(cnfNodes))
+		nodeLabels := mcp.Spec.NodeSelector.MatchLabels
+		key, _ := components.GetFirstKeyAndValue(nodeLabels)
+		req, err := labels.NewRequirement(key, selection.Exists, []string{})
+		if err != nil {
+			return errors.Wrap(err, "Failed creating node selector")
+		}
+
+		selector := labels.NewSelector()
+		selector = selector.Add(*req)
+		cnfNodes, err = nodes.GetBySelector(selector)
+		if err != nil {
+			return errors.Wrap(err, "Failed getting nodes by selector")
+		}
+
+		testlog.Infof("MCP %q is targeting %v node(s)", mcp.Name, len(cnfNodes))
+		return nil
+	}, cluster.ComputeTestTimeout(10*time.Minute, runningOnSingleNode), 5*time.Second).ShouldNot(HaveOccurred(), "Failed to find CNF nodes by MCP %q", mcpName)
 
 	// timeout should be based on the number of worker-cnf nodes
-	timeout := time.Duration(len(cnfNodes) * mcpUpdateTimeoutPerNode)
+	timeout := time.Duration(len(cnfNodes)*mcpUpdateTimeoutPerNode) * time.Minute
+	if len(cnfNodes) == 0 {
+		timeout = 2 * time.Minute
+	}
 
 	EventuallyWithOffset(1, func() corev1.ConditionStatus {
 		return GetConditionStatus(mcpName, conditionType)
-	}, timeout*time.Minute, 30*time.Second).Should(Equal(conditionStatus))
+	}, cluster.ComputeTestTimeout(timeout, runningOnSingleNode), 30*time.Second).Should(Equal(conditionStatus), "Failed to find condition status by MCP %q", mcpName)
 }
 
 // WaitForProfilePickedUp waits for the MCP with given name containing the MC created for the PerformanceProfile with the given name
-func WaitForProfilePickedUp(mcpName string, profileName string) {
+func WaitForProfilePickedUp(mcpName string, profile *performancev2.PerformanceProfile) {
+	runningOnSingleNode, err := cluster.IsSingleNode()
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	testlog.Infof("Waiting for profile %s to be picked up by the %s machine config pool", profile.Name, mcpName)
+	defer testlog.Infof("Profile %s picked up by the %s machine config pool", profile.Name, mcpName)
 	EventuallyWithOffset(1, func() bool {
 		mcp, err := GetByName(mcpName)
-		Expect(err).ToNot(HaveOccurred(), "Failed getting MCP by name")
+		// we ignore the error and just retry in case of single node cluster
+		if err != nil {
+			return false
+		}
 		for _, source := range mcp.Spec.Configuration.Source {
-			if source.Name == fmt.Sprintf("%s-%s", components.ComponentNamePrefix, profileName) {
+			if source.Name == machineconfig.GetMachineConfigName(profile) {
 				return true
 			}
 		}
 		return false
-	}, 10*time.Minute, 30*time.Second).Should(BeTrue(), "PerformanceProfile's MC was not picked up by MCP in time")
+	}, cluster.ComputeTestTimeout(10*time.Minute, runningOnSingleNode), 30*time.Second).Should(BeTrue(), "PerformanceProfile's %q MC was not picked up by MCP %q in time", profile.Name, mcpName)
+}
+
+func Delete(name string) error {
+	mcp := &machineconfigv1.MachineConfigPool{}
+	if err := testclient.Client.Get(context.TODO(), types.NamespacedName{Name: name}, mcp); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if err := testclient.Client.Delete(context.TODO(), mcp); err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -81,30 +81,30 @@ metadata:
         }
       ]
     capabilities: Basic Install
-    containerImage: REPLACE_IMAGE
+    containerImage: quay.io/openshift-kni/performance-addon-operator:4.7-snapshot
     description: Operator to optimize OpenShift clusters for applications sensitive to CPU and network latency.
     olm.skipRange: '>=4.6.0 <4.7.0'
     operators.operatorframework.io/builder: operator-sdk-v1.0.0
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v2
-    repository: https://github.com/operator-kni/performance-addon-operators
+    repository: https://github.com/openshift-kni/performance-addon-operators
   name: performance-addon-operator.v4.7.0
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
   customresourcedefinitions:
     owned:
-    - description: PerformanceProfile is the Schema for the performanceprofiles API.
-      displayName: Performance Profile
+    - description: PerformanceProfile is the Schema for the performanceprofiles API v2.
+      displayName: Performance Profile v2
       kind: PerformanceProfile
       name: performanceprofiles.performance.openshift.io
       version: v2
-    - description: PerformanceProfile is the Schema for the performanceprofiles API.
-      displayName: Performance Profile
+    - description: PerformanceProfile is the Schema for the performanceprofiles API v1.
+      displayName: Performance Profile v1
       kind: PerformanceProfile
       name: performanceprofiles.performance.openshift.io
       version: v1
-    - description: PerformanceProfile is the Schema for the performanceprofiles API.
-      displayName: Performance Profile
+    - description: PerformanceProfile is the Schema for the performanceprofiles API v1alpha1.
+      displayName: Performance Profile v1alpha1
       kind: PerformanceProfile
       name: performanceprofiles.performance.openshift.io
       version: v1alpha1
@@ -161,6 +161,8 @@ spec:
           strategy: {}
           template:
             metadata:
+              annotations:
+                target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
               labels:
                 name: performance-operator
             spec:
@@ -185,7 +187,7 @@ spec:
                       fieldPath: metadata.name
                 - name: OPERATOR_NAME
                   value: performance-operator
-                image: REPLACE_IMAGE
+                image: quay.io/openshift-kni/performance-addon-operator:4.7-snapshot
                 imagePullPolicy: Always
                 name: performance-operator
                 resources: {}
@@ -247,6 +249,7 @@ spec:
   - name: Source Code
     url: https://github.com/openshift-kni/performance-addon-operators
   maturity: alpha
+  minKubeVersion: 1.19.0
   provider:
     name: Red Hat
   version: 4.7.0

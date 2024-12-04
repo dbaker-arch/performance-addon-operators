@@ -3,6 +3,8 @@ package components
 import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
 type listToMask struct {
@@ -17,9 +19,13 @@ var cpuListToMask = []listToMask{
 	{"0-127", "ffffffff,ffffffff,ffffffff,ffffffff"},
 	{"0-255", "ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff"},
 }
-var cpuListToInvertMask = []listToMask{
-	{"0", "ffffffff,fffffffe"}, {"2-3", "ffffffff,fffffff3"}, {"3,4,53-55,61-63", "1f1fffff,ffffffe7"},
-	{"80", "ffffffff,ffffffff"},
+
+func intersectHelper(cpuListA, cpuListB string) ([]int, error) {
+	cpuLists, err := NewCPULists(cpuListA, cpuListB)
+	if err != nil {
+		return nil, err
+	}
+	return cpuLists.Intersect(), nil
 }
 
 var _ = Describe("Components utils", func() {
@@ -31,11 +37,17 @@ var _ = Describe("Components utils", func() {
 				Expect(cpuMask).Should(Equal(cpuEntry.cpuMask))
 			}
 		})
-		It("should generate a valid CPU inverted mask from CPU list ", func() {
-			for _, cpuEntry := range cpuListToInvertMask {
-				cpuMask, err := CPUListTo64BitsMaskList(cpuEntry.cpuList)
+	})
+
+	Context("Convert CPU mask to CPU list", func() {
+		It("should generate a valid CPU list from CPU mask ", func() {
+			for _, cpuEntry := range cpuListToMask {
+				cpuSetFromList, err := cpuset.Parse(cpuEntry.cpuList)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(cpuMask).Should(Equal(cpuEntry.cpuMask))
+				cpuSetFromMask, err := CPUMaskToCPUSet(cpuEntry.cpuMask)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(cpuSetFromList).Should(Equal(cpuSetFromMask))
 			}
 		})
 	})
@@ -47,13 +59,13 @@ var _ = Describe("Components utils", func() {
 			}
 
 			for _, entry := range cpuListInvalid {
-				_, err := CPUListIntersect(entry, entry)
+				_, err := intersectHelper(entry, entry)
 				Expect(err).To(HaveOccurred())
 
-				_, err = CPUListIntersect(entry, "0-3")
+				_, err = intersectHelper(entry, "0-3")
 				Expect(err).To(HaveOccurred())
 
-				_, err = CPUListIntersect("0-3", entry)
+				_, err = intersectHelper("0-3", entry)
 				Expect(err).To(HaveOccurred())
 			}
 		})
@@ -66,6 +78,8 @@ var _ = Describe("Components utils", func() {
 			}
 
 			var cpuListIntersectTestcases = []cpuListIntersect{
+				{"", "0-3", []int{}},
+				{"0-3", "", []int{}},
 				{"0-3", "4-15", []int{}},
 				{"0-3", "8-15", []int{}},
 				{"0-3", "0-15", []int{0, 1, 2, 3}},
@@ -74,7 +88,7 @@ var _ = Describe("Components utils", func() {
 			}
 
 			for _, entry := range cpuListIntersectTestcases {
-				res, err := CPUListIntersect(entry.cpuListA, entry.cpuListB)
+				res, err := intersectHelper(entry.cpuListA, entry.cpuListB)
 				Expect(err).ToNot(HaveOccurred())
 
 				Expect(len(res)).To(Equal(len(entry.result)))

@@ -8,14 +8,15 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	performancev2 "github.com/openshift-kni/performance-addon-operators/api/v2"
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
+	testlog "github.com/openshift-kni/performance-addon-operators/functests/utils/log"
 	v1 "github.com/openshift/custom-resource-status/conditions/v1"
-	corev1 "k8s.io/api/core/v1"
 )
 
 // GetByNodeLabels gets the performance profile that must have node selector equals to passed node labels
@@ -56,7 +57,7 @@ func WaitForDeletion(profileKey types.NamespacedName, timeout time.Duration) err
 // GetCondition the performance profile condition for the given type
 func GetCondition(nodeLabels map[string]string, conditionType v1.ConditionType) *v1.Condition {
 	profile, err := GetByNodeLabels(nodeLabels)
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Failed getting profile by nodelabel")
+	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Failed getting profile by nodelabels %v", nodeLabels)
 	for _, condition := range profile.Status.Conditions {
 		if condition.Type == conditionType {
 			return &condition
@@ -93,4 +94,54 @@ func All() (*performancev2.PerformanceProfileList, error) {
 		return nil, err
 	}
 	return profiles, nil
+}
+
+func UpdateWithRetry(profile *performancev2.PerformanceProfile) {
+	EventuallyWithOffset(1, func() error {
+		updatedProfile := &performancev2.PerformanceProfile{}
+		key := types.NamespacedName{
+			Name:      profile.Name,
+			Namespace: profile.Namespace,
+		}
+		// We should get the updated version of the performance profile.
+		// Otherwise, we will always try to update the profile with the old resource version
+		// and will always get the conflict error
+		if err := testclient.Client.Get(context.TODO(), key, updatedProfile); err != nil {
+			return err
+		}
+
+		updatedProfile.Spec = *profile.Spec.DeepCopy()
+		if err := testclient.Client.Update(context.TODO(), profile); err != nil {
+			if !errors.IsConflict(err) {
+				testlog.Errorf("failed to update the profile %q: %v", profile.Name, err)
+			}
+
+			return err
+		}
+
+		return nil
+	}, time.Minute, 5*time.Second).Should(BeNil())
+}
+
+func WaitForCondition(nodeLabels map[string]string, conditionType v1.ConditionType, conditionStatus corev1.ConditionStatus) {
+	EventuallyWithOffset(1, func() corev1.ConditionStatus {
+		return (GetCondition(nodeLabels, conditionType)).Status
+	}, 15*time.Minute, 30*time.Second).Should(Equal(conditionStatus), "Failed to met performance profile condition %v", conditionType)
+}
+
+// Delete delete the existing profile by name
+func Delete(name string) error {
+	profile := &performancev2.PerformanceProfile{}
+	if err := testclient.Client.Get(context.TODO(), types.NamespacedName{Name: name}, profile); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if err := testclient.Client.Delete(context.TODO(), profile); err != nil {
+		return err
+	}
+
+	return nil
 }

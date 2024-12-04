@@ -13,6 +13,7 @@ import (
 	performancev2 "github.com/openshift-kni/performance-addon-operators/api/v2"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils"
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
+	testlog "github.com/openshift-kni/performance-addon-operators/functests/utils/log"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/mcps"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/profiles"
 	"github.com/openshift-kni/performance-addon-operators/pkg/controller/performanceprofile/components"
@@ -20,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
 )
 
 var cleanPerformance bool
@@ -35,7 +35,7 @@ func init() {
 // All deletes any leftovers created when running the performance tests.
 func All() {
 	if !cleanPerformance {
-		klog.Info("Performance cleaning disabled, skipping")
+		testlog.Info("Performance cleaning disabled, skipping")
 		return
 	}
 
@@ -45,16 +45,6 @@ func All() {
 		return
 	}
 	Expect(err).ToNot(HaveOccurred(), "Failed to find perf profile")
-	err = testclient.Client.Delete(context.TODO(), &perfProfile)
-	Expect(err).ToNot(HaveOccurred(), "Failed to delete perf profile")
-
-	profileKey := types.NamespacedName{
-		Name:      perfProfile.Name,
-		Namespace: perfProfile.Namespace,
-	}
-	err = profiles.WaitForDeletion(profileKey, 60*time.Second)
-	Expect(err).ToNot(HaveOccurred(), "Failed to wait for perf profile deletion")
-
 	mcpLabel := profile.GetMachineConfigLabel(&perfProfile)
 	key, value := components.GetFirstKeyAndValue(mcpLabel)
 	mcpsByLabel, err := mcps.GetByLabel(key, value)
@@ -62,9 +52,19 @@ func All() {
 	Expect(len(mcpsByLabel)).To(Equal(1), fmt.Sprintf("Unexpected number of MCPs found: %v", len(mcpsByLabel)))
 
 	performanceMCP := &mcpsByLabel[0]
+
+	err = testclient.Client.Delete(context.TODO(), &perfProfile)
+	Expect(err).ToNot(HaveOccurred(), "Failed to delete perf profile")
+
 	By("Waiting for MCP starting to update")
 	mcps.WaitForCondition(performanceMCP.Name, mcv1.MachineConfigPoolUpdating, corev1.ConditionTrue)
 
 	By("Waiting for MCP being updated")
 	mcps.WaitForCondition(performanceMCP.Name, mcv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+	profileKey := types.NamespacedName{
+		Name:      perfProfile.Name,
+		Namespace: perfProfile.Namespace,
+	}
+	err = profiles.WaitForDeletion(profileKey, 60*time.Second)
+	Expect(err).ToNot(HaveOccurred(), "Failed to wait for perf profile deletion")
 }

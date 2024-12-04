@@ -1,3 +1,4 @@
+//go:build !unittests
 // +build !unittests
 
 package __performance_test
@@ -11,22 +12,22 @@ import (
 	. "github.com/onsi/gomega"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/klog"
 
 	ginkgo_reporters "kubevirt.io/qe-tools/pkg/ginkgo-reporters"
 
 	testutils "github.com/openshift-kni/performance-addon-operators/functests/utils"
 	testclient "github.com/openshift-kni/performance-addon-operators/functests/utils/client"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/junit"
+	testlog "github.com/openshift-kni/performance-addon-operators/functests/utils/log"
 	"github.com/openshift-kni/performance-addon-operators/functests/utils/namespaces"
 )
 
 var _ = BeforeSuite(func() {
-	Expect(testclient.ClientsEnabled).To(BeTrue())
+	Expect(testclient.ClientsEnabled).To(BeTrue(), "package client not enabled")
 	// create test namespace
 	err := testclient.Client.Create(context.TODO(), namespaces.TestingNamespace)
 	if errors.IsAlreadyExists(err) {
-		klog.Warning("test namespace already exists, that is unexpected")
+		testlog.Warning("test namespace already exists, that is unexpected")
 		return
 	}
 	Expect(err).ToNot(HaveOccurred())

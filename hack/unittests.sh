@@ -10,12 +10,15 @@ FUNC_FILE="${OUTDIR}/coverage.txt"
 HTML_FILE="${OUTDIR}/coverage.html"
 
 echo "running unittests with coverage"
-GOFLAGS=-mod=vendor go test -race -covermode=atomic -coverprofile="${COVER_FILE}" -v ./pkg/... ./controllers/...
+GOFLAGS=-mod=vendor go test -race -covermode=atomic -coverprofile="${COVER_FILE}" -v ./pkg/... ./controllers/... ./api/... ./tools/...
 
 if [[ -n "${DRONE}" ]]; then
 
   # Uploading coverage report to coveralls.io
   go get github.com/mattn/goveralls
+
+  # we should update the vendor/modules.txt once we got a new package
+  go mod vendor
   $(go env GOPATH)/bin/goveralls -coverprofile="$COVER_FILE" -service=drone.io
 
 else

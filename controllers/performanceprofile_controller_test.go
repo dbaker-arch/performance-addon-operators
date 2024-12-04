@@ -37,13 +37,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const assetsDir = "../build/assets"
-
 var _ = Describe("Controller", func() {
 	var request reconcile.Request
 	var profile *performancev2.PerformanceProfile
+	var profileMCP *mcov1.MachineConfigPool
 
 	BeforeEach(func() {
+		profileMCP = testutils.NewProfileMCP()
 		profile = testutils.NewPerformanceProfile("test")
 		request = reconcile.Request{
 			NamespacedName: types.NamespacedName{
@@ -54,7 +54,7 @@ var _ = Describe("Controller", func() {
 	})
 
 	It("should add finalizer to the performance profile", func() {
-		r := newFakeReconciler(profile)
+		r := newFakeReconciler(profile, profileMCP)
 
 		Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -72,49 +72,13 @@ var _ = Describe("Controller", func() {
 			profile.Finalizers = append(profile.Finalizers, finalizer)
 		})
 
-		It("should validate scripts required parameters", func() {
-			profile.Spec.MachineConfigPoolSelector = map[string]string{"fake1": "val1", "fake2": "val2"}
-			r := newFakeReconciler(profile)
-
-			// we do not return error, because we do not want to reconcile again, and just print error under the log,
-			// once we will have validation webhook, this test will not be relevant anymore
-			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
-
-			updatedProfile := &performancev2.PerformanceProfile{}
-			key := types.NamespacedName{
-				Name:      profile.Name,
-				Namespace: metav1.NamespaceNone,
-			}
-			Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
-
-			// verify profile conditions
-			degradeCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
-			Expect(degradeCondition).ToNot(BeNil())
-			Expect(degradeCondition.Status).To(Equal(corev1.ConditionTrue))
-			Expect(degradeCondition.Reason).To(Equal(conditionReasonValidationFailed))
-			Expect(degradeCondition.Message).To(Equal("validation error: you should provide only 1 MachineConfigPoolSelector"))
-
-			// verify validation event
-			fakeRecorder, ok := r.Recorder.(*record.FakeRecorder)
-			Expect(ok).To(BeTrue())
-			event := <-fakeRecorder.Events
-			Expect(event).To(ContainSubstring("Validation failed"))
-
-			// verify that no components created by the controller
-			mcp := &mcov1.MachineConfigPool{}
-			key.Name = components.GetComponentName(profile.Name, components.ComponentNamePrefix)
-			err := r.Get(context.TODO(), key, mcp)
-			Expect(errors.IsNotFound(err)).To(Equal(true))
-		})
-
 		It("should create all resources on first reconcile loop", func() {
-			r := newFakeReconciler(profile)
+			r := newFakeReconciler(profile, profileMCP)
 
 			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
-			name := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
 			key := types.NamespacedName{
-				Name:      name,
+				Name:      machineconfig.GetMachineConfigName(profile),
 				Namespace: metav1.NamespaceNone,
 			}
 
@@ -122,6 +86,11 @@ var _ = Describe("Controller", func() {
 			mc := &mcov1.MachineConfig{}
 			err := r.Get(context.TODO(), key, mc)
 			Expect(err).ToNot(HaveOccurred())
+
+			key = types.NamespacedName{
+				Name:      components.GetComponentName(profile.Name, components.ComponentNamePrefix),
+				Namespace: metav1.NamespaceNone,
+			}
 
 			// verify KubeletConfig creation
 			kc := &mcov1.KubeletConfig{}
@@ -142,7 +111,7 @@ var _ = Describe("Controller", func() {
 		})
 
 		It("should create event on the second reconcile loop", func() {
-			r := newFakeReconciler(profile)
+			r := newFakeReconciler(profile, profileMCP)
 
 			Expect(reconcileTimes(r, request, 2)).To(Equal(reconcile.Result{}))
 
@@ -154,7 +123,7 @@ var _ = Describe("Controller", func() {
 		})
 
 		It("should update the profile status", func() {
-			r := newFakeReconciler(profile)
+			r := newFakeReconciler(profile, profileMCP)
 
 			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -175,24 +144,116 @@ var _ = Describe("Controller", func() {
 			availableCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionAvailable)
 			Expect(availableCondition).ToNot(BeNil())
 			Expect(availableCondition.Status).To(Equal(corev1.ConditionTrue))
+		})
 
+		It("should promote kubelet config failure condition", func() {
+			r := newFakeReconciler(profile, profileMCP)
+			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+			name := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
+			key := types.NamespacedName{
+				Name:      name,
+				Namespace: metav1.NamespaceNone,
+			}
+
+			kc := &mcov1.KubeletConfig{}
+			err := r.Get(context.TODO(), key, kc)
+			Expect(err).ToNot(HaveOccurred())
+
+			now := time.Now()
+			kc.Status.Conditions = []mcov1.KubeletConfigCondition{
+				{
+					Type:               mcov1.KubeletConfigFailure,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: metav1.Time{Time: now.Add(time.Minute)},
+					Reason:             "Test failure condition",
+					Message:            "Test failure condition",
+				},
+				{
+					Type:               mcov1.KubeletConfigSuccess,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: metav1.Time{Time: now},
+					Reason:             "Test succeed condition",
+					Message:            "Test succeed condition",
+				},
+			}
+			Expect(r.Update(context.TODO(), kc)).ToNot(HaveOccurred())
+
+			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+			updatedProfile := &performancev2.PerformanceProfile{}
+			key = types.NamespacedName{
+				Name:      profile.Name,
+				Namespace: metav1.NamespaceNone,
+			}
+			Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+
+			degradedCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
+			Expect(degradedCondition.Status).To(Equal(corev1.ConditionTrue))
+			Expect(degradedCondition.Message).To(Equal("Test failure condition"))
+			Expect(degradedCondition.Reason).To(Equal(conditionKubeletFailed))
+		})
+
+		It("should not promote old failure condition", func() {
+			r := newFakeReconciler(profile, profileMCP)
+			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+			name := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
+			key := types.NamespacedName{
+				Name:      name,
+				Namespace: metav1.NamespaceNone,
+			}
+
+			kc := &mcov1.KubeletConfig{}
+			err := r.Get(context.TODO(), key, kc)
+			Expect(err).ToNot(HaveOccurred())
+
+			now := time.Now()
+			kc.Status.Conditions = []mcov1.KubeletConfigCondition{
+				{
+					Type:               mcov1.KubeletConfigFailure,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: metav1.Time{Time: now},
+					Reason:             "Test failure condition",
+					Message:            "Test failure condition",
+				},
+				{
+					Type:               mcov1.KubeletConfigSuccess,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: metav1.Time{Time: now.Add(time.Minute)},
+					Reason:             "Test succeed condition",
+					Message:            "Test succeed condition",
+				},
+			}
+			Expect(r.Update(context.TODO(), kc)).ToNot(HaveOccurred())
+
+			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+			updatedProfile := &performancev2.PerformanceProfile{}
+			key = types.NamespacedName{
+				Name:      profile.Name,
+				Namespace: metav1.NamespaceNone,
+			}
+			Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+
+			degradedCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
+			Expect(degradedCondition.Status).To(Equal(corev1.ConditionFalse))
 		})
 
 		It("should remove outdated tuned objects", func() {
-
-			tunedOutdatedA, err := tuned.NewNodePerformance(assetsDir, profile)
+			tunedOutdatedA, err := tuned.NewNodePerformance(profile)
 			Expect(err).ToNot(HaveOccurred())
 			tunedOutdatedA.Name = "outdated-a"
 			tunedOutdatedA.OwnerReferences = []metav1.OwnerReference{
 				{Name: profile.Name},
 			}
-			tunedOutdatedB, err := tuned.NewNodePerformance(assetsDir, profile)
+			tunedOutdatedB, err := tuned.NewNodePerformance(profile)
 			Expect(err).ToNot(HaveOccurred())
 			tunedOutdatedB.Name = "outdated-b"
 			tunedOutdatedB.OwnerReferences = []metav1.OwnerReference{
 				{Name: profile.Name},
 			}
-			r := newFakeReconciler(profile, tunedOutdatedA, tunedOutdatedB)
+			r := newFakeReconciler(profile, tunedOutdatedA, tunedOutdatedB, profileMCP)
 
 			keyA := types.NamespacedName{
 				Name:      tunedOutdatedA.Name,
@@ -210,7 +271,7 @@ var _ = Describe("Controller", func() {
 			err = r.Get(context.TODO(), keyB, tb)
 			Expect(err).ToNot(HaveOccurred())
 
-			result, err := r.Reconcile(request)
+			result, err := r.Reconcile(context.TODO(), request)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).To(Equal(reconcile.Result{}))
 
@@ -224,7 +285,7 @@ var _ = Describe("Controller", func() {
 
 		It("should create nothing when pause annotation is set", func() {
 			profile.Annotations = map[string]string{performancev2.PerformanceProfilePauseAnnotation: "true"}
-			r := newFakeReconciler(profile)
+			r := newFakeReconciler(profile, profileMCP)
 
 			Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -270,20 +331,22 @@ var _ = Describe("Controller", func() {
 
 			BeforeEach(func() {
 				var err error
-				mc, err = machineconfig.New(assetsDir, profile)
+
+				mc, err = machineconfig.New(profile)
 				Expect(err).ToNot(HaveOccurred())
 
-				kc, err = kubeletconfig.New(profile)
+				mcpSelectorKey, mcpSelectorValue := components.GetFirstKeyAndValue(profile.Spec.MachineConfigPoolSelector)
+				kc, err = kubeletconfig.New(profile, map[string]string{mcpSelectorKey: mcpSelectorValue})
 				Expect(err).ToNot(HaveOccurred())
 
-				tunedPerformance, err = tuned.NewNodePerformance(assetsDir, profile)
+				tunedPerformance, err = tuned.NewNodePerformance(profile)
 				Expect(err).ToNot(HaveOccurred())
 
 				runtimeClass = runtimeclass.New(profile, machineconfig.HighPerformanceRuntime)
 			})
 
 			It("should not record new create event", func() {
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -300,13 +363,12 @@ var _ = Describe("Controller", func() {
 
 			It("should update MC when RT kernel gets disabled", func() {
 				profile.Spec.RealTimeKernel.Enabled = pointer.BoolPtr(false)
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
-				name := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
 				key := types.NamespacedName{
-					Name:      name,
+					Name:      machineconfig.GetMachineConfigName(profile),
 					Namespace: metav1.NamespaceNone,
 				}
 
@@ -326,7 +388,7 @@ var _ = Describe("Controller", func() {
 					Isolated: &isolated,
 				}
 
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -361,7 +423,7 @@ var _ = Describe("Controller", func() {
 					BalanceIsolated: pointer.BoolPtr(true),
 				}
 
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -385,7 +447,7 @@ var _ = Describe("Controller", func() {
 					BalanceIsolated: pointer.BoolPtr(false),
 				}
 
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -412,7 +474,7 @@ var _ = Describe("Controller", func() {
 					},
 				}
 
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -441,7 +503,7 @@ var _ = Describe("Controller", func() {
 					},
 				}
 
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
@@ -458,7 +520,7 @@ var _ = Describe("Controller", func() {
 
 				By("Verifying MC update")
 				key = types.NamespacedName{
-					Name:      components.GetComponentName(profile.Name, components.ComponentNamePrefix),
+					Name:      machineconfig.GetMachineConfigName(profile),
 					Namespace: metav1.NamespaceNone,
 				}
 				mc := &mcov1.MachineConfig{}
@@ -481,7 +543,7 @@ var _ = Describe("Controller", func() {
 			})
 
 			It("should update status with generated tuned", func() {
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, profileMCP)
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 				key := types.NamespacedName{
 					Name:      components.GetComponentName(profile.Name, components.ProfileNamePerformance),
@@ -502,7 +564,7 @@ var _ = Describe("Controller", func() {
 			})
 
 			It("should update status with generated runtime class", func() {
-				r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass)
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass, profileMCP)
 				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
 
 				key := types.NamespacedName{
@@ -534,14 +596,20 @@ var _ = Describe("Controller", func() {
 					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "mcp-test",
+						Labels: map[string]string{
+							testutils.MachineConfigPoolLabelKey: testutils.MachineConfigPoolLabelValue,
+						},
 					},
 					Spec: mcov1.MachineConfigPoolSpec{
+						NodeSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"nodekey": "nodeValue"},
+						},
 						MachineConfigSelector: &metav1.LabelSelector{
 							MatchExpressions: []metav1.LabelSelectorRequirement{
 								{
-									Key:      testutils.MachineConfigPoolLabelKey,
+									Key:      testutils.MachineConfigLabelKey,
 									Operator: metav1.LabelSelectorOpIn,
-									Values:   []string{testutils.MachineConfigPoolLabelValue},
+									Values:   []string{testutils.MachineConfigLabelValue},
 								},
 							},
 						},
@@ -579,8 +647,128 @@ var _ = Describe("Controller", func() {
 				Expect(degradedCondition.Reason).To(Equal(conditionReasonMCPDegraded))
 				Expect(degradedCondition.Message).To(ContainSubstring(mcpMessage))
 			})
+
+			It("should update status when TunedProfile is degraded", func() {
+				tunedReason := "tunedReason"
+				tunedMessage := "Tuned message"
+
+				tuned := &tunedv1.Profile{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "tuned-profile-test",
+					},
+					Status: tunedv1.ProfileStatus{
+						Conditions: []tunedv1.ProfileStatusCondition{
+							{
+								Type:    tunedv1.TunedDegraded,
+								Status:  corev1.ConditionTrue,
+								Reason:  tunedReason,
+								Message: tunedMessage,
+							},
+							{
+								Type:    tunedv1.TunedProfileApplied,
+								Status:  corev1.ConditionFalse,
+								Reason:  tunedReason,
+								Message: tunedMessage,
+							},
+						},
+					},
+				}
+
+				nodes := &corev1.NodeList{
+					Items: []corev1.Node{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "tuned-profile-test",
+								Labels: map[string]string{
+									"nodekey": "nodeValue",
+								},
+							},
+						},
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "tuned-profile-test2",
+							},
+						},
+					},
+				}
+
+				r := newFakeReconciler(profile, mc, kc, tunedPerformance, tuned, nodes, profileMCP)
+
+				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+				updatedProfile := &performancev2.PerformanceProfile{}
+				key := types.NamespacedName{
+					Name:      profile.Name,
+					Namespace: metav1.NamespaceNone,
+				}
+				Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+
+				// verify performance profile status
+				Expect(len(updatedProfile.Status.Conditions)).To(Equal(4))
+
+				// verify profile conditions
+				degradedCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
+				Expect(degradedCondition).ToNot(BeNil())
+				Expect(degradedCondition.Status).To(Equal(corev1.ConditionTrue))
+				Expect(degradedCondition.Reason).To(Equal(conditionReasonTunedDegraded))
+				Expect(degradedCondition.Message).To(ContainSubstring(tunedMessage))
+			})
 		})
 
+		When("the provided machine config labels are different from one specified under the machine config pool", func() {
+			It("should move the performance profile to the degraded state", func() {
+				profileMCP.Spec.MachineConfigSelector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{"wrongKey": "bad"},
+				}
+				r := newFakeReconciler(profile, profileMCP)
+				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+				updatedProfile := &performancev2.PerformanceProfile{}
+				key := types.NamespacedName{
+					Name:      profile.Name,
+					Namespace: metav1.NamespaceNone,
+				}
+				Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+
+				// verify performance profile status
+				Expect(len(updatedProfile.Status.Conditions)).To(Equal(4))
+
+				// verify profile conditions
+				degradedCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
+				Expect(degradedCondition).ToNot(BeNil())
+				Expect(degradedCondition.Status).To(Equal(corev1.ConditionTrue))
+				Expect(degradedCondition.Reason).To(Equal(conditionBadMachineConfigLabels))
+				Expect(degradedCondition.Message).To(ContainSubstring("provided via profile.spec.machineConfigLabel do not match the MachineConfigPool"))
+			})
+		})
+
+		When("the generated machine config labels are different from one specified under the machine config pool", func() {
+			It("should move the performance profile to the degraded state", func() {
+				profileMCP.Spec.MachineConfigSelector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{"wrongKey": "bad"},
+				}
+				profile.Spec.MachineConfigLabel = nil
+				r := newFakeReconciler(profile, profileMCP)
+				Expect(reconcileTimes(r, request, 1)).To(Equal(reconcile.Result{}))
+
+				updatedProfile := &performancev2.PerformanceProfile{}
+				key := types.NamespacedName{
+					Name:      profile.Name,
+					Namespace: metav1.NamespaceNone,
+				}
+				Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+
+				// verify performance profile status
+				Expect(len(updatedProfile.Status.Conditions)).To(Equal(4))
+
+				// verify profile conditions
+				degradedCondition := conditionsv1.FindStatusCondition(updatedProfile.Status.Conditions, conditionsv1.ConditionDegraded)
+				Expect(degradedCondition).ToNot(BeNil())
+				Expect(degradedCondition.Status).To(Equal(corev1.ConditionTrue))
+				Expect(degradedCondition.Reason).To(Equal(conditionBadMachineConfigLabels))
+				Expect(degradedCondition.Message).To(ContainSubstring("generated from the profile.spec.nodeSelector"))
+			})
+		})
 	})
 
 	Context("with profile with deletion timestamp", func() {
@@ -592,20 +780,20 @@ var _ = Describe("Controller", func() {
 		})
 
 		It("should remove all components and remove the finalizer on first reconcile loop", func() {
-
-			mc, err := machineconfig.New(assetsDir, profile)
+			mc, err := machineconfig.New(profile)
 			Expect(err).ToNot(HaveOccurred())
 
-			kc, err := kubeletconfig.New(profile)
+			mcpSelectorKey, mcpSelectorValue := components.GetFirstKeyAndValue(profile.Spec.MachineConfigPoolSelector)
+			kc, err := kubeletconfig.New(profile, map[string]string{mcpSelectorKey: mcpSelectorValue})
 			Expect(err).ToNot(HaveOccurred())
 
-			tunedPerformance, err := tuned.NewNodePerformance(assetsDir, profile)
+			tunedPerformance, err := tuned.NewNodePerformance(profile)
 			Expect(err).ToNot(HaveOccurred())
 
 			runtimeClass := runtimeclass.New(profile, machineconfig.HighPerformanceRuntime)
 
-			r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass)
-			result, err := r.Reconcile(request)
+			r := newFakeReconciler(profile, mc, kc, tunedPerformance, runtimeClass, profileMCP)
+			result, err := r.Reconcile(context.TODO(), request)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).To(Equal(reconcile.Result{}))
 
@@ -634,13 +822,43 @@ var _ = Describe("Controller", func() {
 			err = r.Get(context.TODO(), key, tunedPerformance)
 			Expect(errors.IsNotFound(err)).To(Equal(true))
 
-			// verify finalizer deletion
+			// verify profile deletion
 			key.Name = profile.Name
 			key.Namespace = metav1.NamespaceNone
 			updatedProfile := &performancev2.PerformanceProfile{}
-			Expect(r.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
-			Expect(hasFinalizer(updatedProfile, finalizer)).To(Equal(false))
+			err = r.Get(context.TODO(), key, updatedProfile)
+			Expect(errors.IsNotFound(err)).To(Equal(true))
 		})
+	})
+
+	It("should map machine config pool to the performance profile", func() {
+		mcp := &mcov1.MachineConfigPool{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: mcov1.GroupVersion.String(),
+				Kind:       "MachineConfigPool",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "mcp-test",
+			},
+			Spec: mcov1.MachineConfigPoolSpec{
+				NodeSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"nodekey": "nodeValue"},
+				},
+				MachineConfigSelector: &metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      testutils.MachineConfigLabelKey,
+							Operator: metav1.LabelSelectorOpIn,
+							Values:   []string{testutils.MachineConfigLabelValue},
+						},
+					},
+				},
+			},
+		}
+		r := newFakeReconciler(profile, mcp)
+		requests := r.mcpToPerformanceProfile(mcp)
+		Expect(requests).NotTo(BeEmpty())
+		Expect(requests[0].Name).To(Equal(profile.Name))
 	})
 })
 
@@ -648,7 +866,7 @@ func reconcileTimes(reconciler *PerformanceProfileReconciler, request reconcile.
 	var result reconcile.Result
 	var err error
 	for i := 0; i < times; i++ {
-		result, err = reconciler.Reconcile(request)
+		result, err = reconciler.Reconcile(context.TODO(), request)
 		Expect(err).ToNot(HaveOccurred())
 	}
 	return result
@@ -656,12 +874,11 @@ func reconcileTimes(reconciler *PerformanceProfileReconciler, request reconcile.
 
 // newFakeReconciler returns a new reconcile.Reconciler with a fake client
 func newFakeReconciler(initObjects ...runtime.Object) *PerformanceProfileReconciler {
-	fakeClient := fake.NewFakeClientWithScheme(scheme.Scheme, initObjects...)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithRuntimeObjects(initObjects...).Build()
 	fakeRecorder := record.NewFakeRecorder(10)
 	return &PerformanceProfileReconciler{
-		Client:    fakeClient,
-		Scheme:    scheme.Scheme,
-		Recorder:  fakeRecorder,
-		AssetsDir: assetsDir,
+		Client:   fakeClient,
+		Scheme:   scheme.Scheme,
+		Recorder: fakeRecorder,
 	}
 }
